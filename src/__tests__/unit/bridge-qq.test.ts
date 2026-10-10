@@ -908,6 +908,123 @@ describe('numeric shortcut permission replies', () => {
     assert.equal(store.permLinks.get('perm-compat').resolved, true, '/perm command should still work');
     assert.ok(sentMessages.some(m => m.text.includes('recorded')), 'Should confirm via /perm');
   });
+
+  it('/perm list shows pending permissions with numbers and tool names', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    store.permLinks.set('perm-list-1', {
+      permissionRequestId: 'perm-list-1',
+      chatId: 'user-1',
+      messageId: 'msg-1',
+      resolved: false,
+      suggestions: '',
+      toolName: 'WebSearch',
+    });
+    store.permLinks.set('perm-list-2', {
+      permissionRequestId: 'perm-list-2',
+      chatId: 'user-1',
+      messageId: 'msg-2',
+      resolved: false,
+      suggestions: '',
+      toolName: 'Bash',
+    });
+
+    const sentMessages: OutboundMessage[] = [];
+    const adapter = createMockQQAdapter({
+      sendFn: async (msg) => {
+        sentMessages.push(msg);
+        return { ok: true, messageId: 'reply-1' };
+      },
+    });
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'user-perm-list',
+      address: { channelType: 'qq' as const, chatId: 'user-1', userId: 'user-1' },
+      text: '/perm list',
+      timestamp: Date.now(),
+    });
+
+    const text = sentMessages.map(m => m.text).join('\n');
+    assert.ok(text.includes('Pending permissions (2)'), 'Should show pending count');
+    assert.ok(text.includes('WebSearch'), 'Should show tool name');
+    assert.ok(text.includes('perm-list-1'), 'Should show permission id');
+  });
+
+  it('/perm <action> all resolves every pending permission', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    store.permLinks.set('perm-all-1', {
+      permissionRequestId: 'perm-all-1',
+      chatId: 'user-1',
+      messageId: 'msg-1',
+      resolved: false,
+      suggestions: '',
+    });
+    store.permLinks.set('perm-all-2', {
+      permissionRequestId: 'perm-all-2',
+      chatId: 'user-1',
+      messageId: 'msg-2',
+      resolved: false,
+      suggestions: '',
+    });
+
+    const sentMessages: OutboundMessage[] = [];
+    const adapter = createMockQQAdapter({
+      sendFn: async (msg) => {
+        sentMessages.push(msg);
+        return { ok: true, messageId: 'reply-1' };
+      },
+    });
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'user-perm-all',
+      address: { channelType: 'qq' as const, chatId: 'user-1', userId: 'user-1' },
+      text: '/perm deny all',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(store.permLinks.get('perm-all-1').resolved, true, 'perm-all-1 should be resolved');
+    assert.equal(store.permLinks.get('perm-all-2').resolved, true, 'perm-all-2 should be resolved');
+    assert.ok(sentMessages.some(m => m.text.includes('2/2')), 'Should report both resolved');
+  });
+
+  it('/perm <action> <number> resolves the numbered pending permission', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    // Map iteration order is insertion order → number 2 is perm-idx-2
+    store.permLinks.set('perm-idx-1', {
+      permissionRequestId: 'perm-idx-1',
+      chatId: 'user-1',
+      messageId: 'msg-1',
+      resolved: false,
+      suggestions: '',
+    });
+    store.permLinks.set('perm-idx-2', {
+      permissionRequestId: 'perm-idx-2',
+      chatId: 'user-1',
+      messageId: 'msg-2',
+      resolved: false,
+      suggestions: '',
+    });
+
+    const sentMessages: OutboundMessage[] = [];
+    const adapter = createMockQQAdapter({
+      sendFn: async (msg) => {
+        sentMessages.push(msg);
+        return { ok: true, messageId: 'reply-1' };
+      },
+    });
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'user-perm-idx',
+      address: { channelType: 'qq' as const, chatId: 'user-1', userId: 'user-1' },
+      text: '/perm allow 2',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(store.permLinks.get('perm-idx-1').resolved, false, 'perm-idx-1 should stay pending');
+    assert.equal(store.permLinks.get('perm-idx-2').resolved, true, 'perm-idx-2 should be resolved');
+  });
 });
 
 // ── 10. bridge-manager sdkSessionId update logic ─────────────────

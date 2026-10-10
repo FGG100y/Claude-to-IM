@@ -549,7 +549,7 @@ async function handleMessage(
         // Multiple pending permissions — numeric shortcut is ambiguous.
         await deliver(adapter, {
           address: msg.address,
-          text: `Multiple pending permissions (${pendingLinks.length}). Please use the full command:\n/perm allow|allow_session|deny <id>`,
+          text: `Multiple pending permissions (${pendingLinks.length}). Reply /perm list to see them, then /perm allow|allow_session|deny <number>.`,
           parseMode: 'plain',
           replyToMessageId: msg.messageId,
         });
@@ -825,7 +825,8 @@ async function handleCommand(
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
-        '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
+        '/perm allow|allow_session|deny all - Respond to every pending request',
+        '/perm list - List pending permission requests',
         '/help - Show this help',
       ].join('\n');
       break;
@@ -943,16 +944,67 @@ async function handleCommand(
 
     case '/perm': {
       // Text-based permission approval fallback (for channels without inline buttons)
-      // Usage: /perm allow <id> | /perm allow_session <id> | /perm deny <id>
-      const permParts = args.split(/\s+/);
-      const permAction = permParts[0];
-      const permId = permParts.slice(1).join(' ');
-      if (!permAction || !permId || !['allow', 'allow_session', 'deny'].includes(permAction)) {
-        response = 'Usage: /perm allow|allow_session|deny &lt;permission_id&gt;';
+      // Usage:
+      //   /perm list                                   - list pending permissions
+      //   /perm allow|allow_session|deny <id>          - respond by permission id
+      //   /perm allow|allow_session|deny <number>      - respond by /perm list number
+      //   /perm allow|allow_session|deny all           - respond to every pending one
+      const pendingPerms = store.listPendingPermissionLinksByChat(msg.address.chatId);
+      const permParts = args.split(/\s+/).filter(Boolean);
+      const permAction = (permParts[0] || '').toLowerCase();
+
+      // `/perm` or `/perm list` → show what is pending so the user can act on it.
+      if (!permAction || permAction === 'list') {
+        if (pendingPerms.length === 0) {
+          response = 'No pending permissions.';
+        } else {
+          const lines = [`<b>Pending permissions (${pendingPerms.length}):</b>`, ''];
+          pendingPerms.forEach((link, i) => {
+            const tool = link.toolName ? escapeHtml(link.toolName) : 'unknown tool';
+            lines.push(`${i + 1}. ${tool}`);
+            lines.push(`   <code>${escapeHtml(link.permissionRequestId)}</code>`);
+          });
+          lines.push('');
+          lines.push('Reply <code>/perm allow|allow_session|deny &lt;number&gt;</code>, or <code>... all</code>.');
+          response = lines.join('\n');
+        }
         break;
       }
-      const callbackData = `perm:${permAction}:${permId}`;
-      const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId);
+
+      const permTarget = permParts.slice(1).join(' ').trim();
+      if (!permTarget || !['allow', 'allow_session', 'deny'].includes(permAction)) {
+        response = 'Usage: /perm list | /perm allow|allow_session|deny &lt;number|id|all&gt;';
+        break;
+      }
+
+      const resolvePerm = (permId: string): boolean =>
+        broker.handlePermissionCallback(`perm:${permAction}:${permId}`, msg.address.chatId);
+
+      if (permTarget === 'all') {
+        if (pendingPerms.length === 0) {
+          response = 'No pending permissions.';
+          break;
+        }
+        let ok = 0;
+        for (const link of pendingPerms) {
+          if (resolvePerm(link.permissionRequestId)) ok++;
+        }
+        response = `Permission ${permAction}: recorded for ${ok}/${pendingPerms.length} request(s).`;
+        break;
+      }
+
+      // Accept a 1-based number from `/perm list`, or a raw permission id.
+      let permId = permTarget;
+      if (/^\d+$/.test(permTarget)) {
+        const idx = Number(permTarget) - 1;
+        if (idx < 0 || idx >= pendingPerms.length) {
+          response = `No pending permission #${permTarget}. Send /perm list to see the current list.`;
+          break;
+        }
+        permId = pendingPerms[idx].permissionRequestId;
+      }
+
+      const handled = resolvePerm(permId);
       if (handled) {
         response = `Permission ${permAction}: recorded.`;
       } else {
@@ -972,7 +1024,8 @@ async function handleCommand(
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
-        '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
+        '/perm allow|allow_session|deny all - Respond to every pending request',
+        '/perm list - List pending permission requests',
         '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
         '/help - Show this help',
       ].join('\n');

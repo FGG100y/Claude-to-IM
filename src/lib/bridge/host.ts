@@ -114,6 +114,9 @@ export interface PermissionLinkRecord {
   messageId: string;
   resolved: boolean;
   suggestions: string;
+  /** Tool the permission was requested for. Optional: records written before
+   *  this field existed won't have it. */
+  toolName?: string;
 }
 
 /** Input for inserting an outbound reference. */
