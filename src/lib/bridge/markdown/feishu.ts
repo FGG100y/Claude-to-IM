@@ -187,13 +187,9 @@ export function buildPermissionButtonCard(
   permissionRequestId: string,
   chatId?: string,
 ): string {
-  const buttons = [
-    { label: 'Allow', type: 'primary', action: 'allow' },
-    { label: 'Allow Session', type: 'default', action: 'allow_session' },
-    { label: 'Deny', type: 'danger', action: 'deny' },
-  ];
+  type PermButton = { label: string; type: string; action: string };
 
-  const buttonColumns = buttons.map((btn) => ({
+  const toColumns = (buttons: PermButton[]) => buttons.map((btn) => ({
     tag: 'column',
     width: 'auto',
     elements: [{
@@ -204,6 +200,18 @@ export function buildPermissionButtonCard(
       value: { callback_data: `perm:${btn.action}:${permissionRequestId}`, ...(chatId ? { chatId } : {}) },
     }],
   }));
+
+  const allowButtons: PermButton[] = [
+    { label: 'Allow', type: 'primary', action: 'allow' },
+    { label: 'Allow Session', type: 'default', action: 'allow_session' },
+    { label: 'Deny', type: 'danger', action: 'deny' },
+  ];
+
+  // Deny only fails that one tool call — the agent keeps working on the turn.
+  // The aborting variant gets its own row so it isn't a mis-tap.
+  const stopButtons: PermButton[] = [
+    { label: 'Deny & Stop', type: 'danger', action: 'deny_stop' },
+  ];
 
   return JSON.stringify({
     schema: '2.0',
@@ -223,12 +231,18 @@ export function buildPermissionButtonCard(
           tag: 'column_set',
           flex_mode: 'none',
           horizontal_align: 'left',
-          columns: buttonColumns,
+          columns: toColumns(allowButtons),
+        },
+        {
+          tag: 'column_set',
+          flex_mode: 'none',
+          horizontal_align: 'left',
+          columns: toColumns(stopButtons),
         },
         { tag: 'hr' },
         {
           tag: 'markdown',
-          content: 'Or reply: `1` Allow · `2` Allow Session · `3` Deny',
+          content: 'Or reply: `1` Allow · `2` Allow Session · `3` Deny · `4` Deny & Stop',
           text_size: 'notation',
         },
       ],

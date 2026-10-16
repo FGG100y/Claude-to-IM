@@ -71,12 +71,14 @@ export async function forwardPermissionRequest(
       `Reply:`,
       `1 - Allow once`,
       `2 - Allow session`,
-      `3 - Deny`,
+      `3 - Deny this tool call`,
+      `4 - Deny and stop the turn`,
       ``,
       `Or use full command:`,
       `/perm allow ${permissionRequestId}`,
       `/perm allow_session ${permissionRequestId}`,
       `/perm deny ${permissionRequestId}`,
+      `/perm deny_stop ${permissionRequestId}`,
     ].join('\n');
 
     const plainMessage: OutboundMessage = {
@@ -110,6 +112,11 @@ export async function forwardPermissionRequest(
           { text: 'Allow Session', callbackData: `perm:allow_session:${permissionRequestId}` },
           { text: 'Deny', callbackData: `perm:deny:${permissionRequestId}` },
         ],
+        // Deny only fails that one tool call — the agent keeps working on the
+        // turn. The aborting variant gets its own row so it isn't a mis-tap.
+        [
+          { text: 'Deny & Stop', callbackData: `perm:deny_stop:${permissionRequestId}` },
+        ],
       ],
       replyToMessageId,
     };
@@ -141,6 +148,27 @@ export async function forwardPermissionRequest(
  *
  * Returns true if the callback was recognized and handled.
  */
+export interface ParsedPermissionCallback {
+  action: string;
+  permissionRequestId: string;
+}
+
+/**
+ * Parse a `perm:<action>:<permissionRequestId>` payload.
+ *
+ * Exported so callers can branch on the action — bridge-manager aborts the
+ * in-flight turn for `deny_stop` — without duplicating the wire format.
+ */
+export function parsePermissionCallback(callbackData: string): ParsedPermissionCallback | null {
+  const parts = callbackData.split(':');
+  if (parts.length < 3 || parts[0] !== 'perm') return null;
+
+  const action = parts[1];
+  const permissionRequestId = parts.slice(2).join(':'); // permId might contain colons
+  if (!action || !permissionRequestId) return null;
+  return { action, permissionRequestId };
+}
+
 export function handlePermissionCallback(
   callbackData: string,
   callbackChatId: string,
@@ -148,12 +176,10 @@ export function handlePermissionCallback(
 ): boolean {
   const { store, permissions } = getBridgeContext();
 
-  // Parse callback data: perm:action:permId
-  const parts = callbackData.split(':');
-  if (parts.length < 3 || parts[0] !== 'perm') return false;
+  const parsed = parsePermissionCallback(callbackData);
+  if (!parsed) return false;
 
-  const action = parts[1];
-  const permissionRequestId = parts.slice(2).join(':'); // permId might contain colons
+  const { action, permissionRequestId } = parsed;
 
   // Look up the permission link to validate origin and check dedup
   const link = store.getPermissionLink(permissionRequestId);
@@ -221,6 +247,9 @@ export function handlePermissionCallback(
     }
 
     case 'deny':
+    case 'deny_stop':
+      // `deny_stop` resolves identically; bridge-manager additionally aborts the
+      // in-flight turn once this returns true.
       resolved = permissions.resolvePendingPermission(permissionRequestId, {
         behavior: 'deny',
         message: 'Denied via IM bridge',

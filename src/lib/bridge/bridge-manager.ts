@@ -432,6 +432,65 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
 }
 
 /**
+ * Abort the turn currently running for this chat, if any. Mirrors `/stop`.
+ */
+function abortActiveTask(address: InboundMessage['address']): void {
+  try {
+    const binding = router.resolve(address);
+    const activeTasks = getState().activeTasks;
+    const taskAbort = activeTasks.get(binding.codepilotSessionId);
+    if (taskAbort) {
+      taskAbort.abort();
+      activeTasks.delete(binding.codepilotSessionId);
+    }
+  } catch (err) {
+    console.warn('[bridge-manager] Failed to abort active task:', err instanceof Error ? err.message : err);
+  }
+}
+
+/**
+ * Record a permission decision, then post-process the action.
+ *
+ * Denying a tool call only fails that one call — the agent keeps working on the
+ * turn — so say so explicitly, and let `deny_stop` additionally abort it.
+ * Returns false when the callback was rejected (unknown id, wrong chat, stale).
+ */
+async function respondToPermission(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  callbackData: string,
+): Promise<boolean> {
+  const parsed = broker.parsePermissionCallback(callbackData);
+  const handled = broker.handlePermissionCallback(
+    callbackData,
+    msg.address.chatId,
+    msg.callbackMessageId,
+  );
+  if (!handled) return false;
+
+  const confirmations: Record<string, string> = {
+    allow: 'Allowed. Claude is continuing this turn.',
+    allow_session: 'Allowed for this session. Claude is continuing this turn.',
+    deny: 'Denied this tool call. Claude keeps working on the current turn — send /stop to abort it.',
+    deny_stop: 'Denied this tool call and stopping the current turn…',
+  };
+
+  await deliver(adapter, {
+    address: msg.address,
+    text: (parsed && confirmations[parsed.action]) || 'Permission response recorded.',
+    parseMode: 'plain',
+  });
+
+  // The permission is resolved above, so the waiting canUseTool() unblocks
+  // cleanly and nothing is left pending when the turn is torn down.
+  if (parsed?.action === 'deny_stop') {
+    abortActiveTask(msg.address);
+  }
+
+  return true;
+}
+
+/**
  * Handle a single inbound message.
  */
 async function handleMessage(
@@ -457,16 +516,7 @@ async function handleMessage(
 
   // Handle callback queries (permission buttons)
   if (msg.callbackData) {
-    const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
-    if (handled) {
-      // Send confirmation
-      const confirmMsg: OutboundMessage = {
-        address: msg.address,
-        text: 'Permission response recorded.',
-        parseMode: 'plain',
-      };
-      await deliver(adapter, confirmMsg);
-    }
+    await respondToPermission(adapter, msg, msg.callbackData);
     ack();
     return;
   }
@@ -505,8 +555,9 @@ async function handleMessage(
 
   // ── Numeric shortcut for permission replies (feishu/qq/weixin only) ──
   // On mobile, typing `/perm allow <uuid>` is painful.
-  // If the user sends "1", "2", or "3" and there is exactly one pending
-  // permission for this chat, map it: 1→allow, 2→allow_session, 3→deny.
+  // If the user sends "1", "2", "3", or "4" and there is exactly one pending
+  // permission for this chat, map it:
+  // 1→allow, 2→allow_session, 3→deny, 4→deny_stop.
   //
   // Input normalization: mobile keyboards / IM clients may send fullwidth
   // digits (１２３), digits with zero-width joiners, or other Unicode
@@ -518,23 +569,21 @@ async function handleMessage(
   ) {
     // eslint-disable-next-line no-control-regex
     const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-    if (/^[123]$/.test(normalized)) {
+    if (/^[1234]$/.test(normalized)) {
       const pendingLinks = store.listPendingPermissionLinksByChat(msg.address.chatId);
       if (pendingLinks.length === 1) {
-        const actionMap: Record<string, string> = { '1': 'allow', '2': 'allow_session', '3': 'deny' };
+        const actionMap: Record<string, string> = {
+          '1': 'allow',
+          '2': 'allow_session',
+          '3': 'deny',
+          '4': 'deny_stop',
+        };
         const action = actionMap[normalized];
         const permId = pendingLinks[0].permissionRequestId;
-        const callbackData = `perm:${action}:${permId}`;
-        const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId);
-        const label = normalized === '1' ? 'Allow' : normalized === '2' ? 'Allow Session' : 'Deny';
-        if (handled) {
-          await deliver(adapter, {
-            address: msg.address,
-            text: `${label}: recorded.`,
-            parseMode: 'plain',
-            replyToMessageId: msg.messageId,
-          });
-        } else {
+        // Shares the callback path so `4` aborts the turn the same way the
+        // "Deny & Stop" button does.
+        const handled = await respondToPermission(adapter, msg, `perm:${action}:${permId}`);
+        if (!handled) {
           await deliver(adapter, {
             address: msg.address,
             text: `Permission not found or already resolved.`,
@@ -549,7 +598,7 @@ async function handleMessage(
         // Multiple pending permissions — numeric shortcut is ambiguous.
         await deliver(adapter, {
           address: msg.address,
-          text: `Multiple pending permissions (${pendingLinks.length}). Reply /perm list to see them, then /perm allow|allow_session|deny <number>.`,
+          text: `Multiple pending permissions (${pendingLinks.length}). Reply /perm list to see them, then /perm allow|allow_session|deny|deny_stop <number>.`,
           parseMode: 'plain',
           replyToMessageId: msg.messageId,
         });
@@ -557,7 +606,7 @@ async function handleMessage(
         return;
       }
       // pendingLinks.length === 0: no pending permissions, fall through as normal message
-    } else if (rawText !== normalized && /^[123]$/.test(rawText) === false) {
+    } else if (rawText !== normalized && /^[1234]$/.test(rawText) === false) {
       // Log when normalization changed the text — helps diagnose encoding issues
       const codePoints = [...rawText].map(c => 'U+' + c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0'));
       console.log(`[bridge-manager] Shortcut candidate raw codepoints: ${codePoints.join(' ')} → normalized: "${normalized}"`);
@@ -714,7 +763,12 @@ async function handleMessage(
     let cardFinalized = false;
     if (hasStreamingCards && adapter.onStreamEnd) {
       try {
-        const status = result.hasError ? 'error' : 'completed';
+        // A user-initiated abort (/stop, or the Deny & Stop permission button)
+        // is not a failure. The adapter renders 'interrupted' with a neutral
+        // footer, so the card stops claiming the turn errored out.
+        const status = taskAbort.signal.aborted
+          ? 'interrupted'
+          : result.hasError ? 'error' : 'completed';
         cardFinalized = await adapter.onStreamEnd(msg.address.chatId, status, result.responseText);
       } catch (err) {
         console.warn('[bridge-manager] Card finalize failed:', err instanceof Error ? err.message : err);
@@ -825,7 +879,7 @@ async function handleCommand(
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
-        '/perm allow|allow_session|deny all - Respond to every pending request',
+        '/perm allow|allow_session|deny|deny_stop all - Respond to every pending request',
         '/perm list - List pending permission requests',
         '/help - Show this help',
       ].join('\n');
@@ -945,10 +999,11 @@ async function handleCommand(
     case '/perm': {
       // Text-based permission approval fallback (for channels without inline buttons)
       // Usage:
-      //   /perm list                                   - list pending permissions
-      //   /perm allow|allow_session|deny <id>          - respond by permission id
-      //   /perm allow|allow_session|deny <number>      - respond by /perm list number
-      //   /perm allow|allow_session|deny all           - respond to every pending one
+      //   /perm list                                            - list pending permissions
+      //   /perm allow|allow_session|deny|deny_stop <id>         - respond by permission id
+      //   /perm allow|allow_session|deny|deny_stop <number>     - respond by /perm list number
+      //   /perm allow|allow_session|deny|deny_stop all          - respond to every pending one
+      // `deny_stop` also aborts the in-flight turn, like the card button.
       const pendingPerms = store.listPendingPermissionLinksByChat(msg.address.chatId);
       const permParts = args.split(/\s+/).filter(Boolean);
       const permAction = (permParts[0] || '').toLowerCase();
@@ -965,20 +1020,26 @@ async function handleCommand(
             lines.push(`   <code>${escapeHtml(link.permissionRequestId)}</code>`);
           });
           lines.push('');
-          lines.push('Reply <code>/perm allow|allow_session|deny &lt;number&gt;</code>, or <code>... all</code>.');
+          lines.push('Reply <code>/perm allow|allow_session|deny|deny_stop &lt;number&gt;</code>, or <code>... all</code>.');
           response = lines.join('\n');
         }
         break;
       }
 
       const permTarget = permParts.slice(1).join(' ').trim();
-      if (!permTarget || !['allow', 'allow_session', 'deny'].includes(permAction)) {
-        response = 'Usage: /perm list | /perm allow|allow_session|deny &lt;number|id|all&gt;';
+      if (!permTarget || !['allow', 'allow_session', 'deny', 'deny_stop'].includes(permAction)) {
+        response = 'Usage: /perm list | /perm allow|allow_session|deny|deny_stop &lt;number|id|all&gt;';
         break;
       }
 
-      const resolvePerm = (permId: string): boolean =>
-        broker.handlePermissionCallback(`perm:${permAction}:${permId}`, msg.address.chatId);
+      const resolvePerm = (permId: string): boolean => {
+        const resolved = broker.handlePermissionCallback(`perm:${permAction}:${permId}`, msg.address.chatId);
+        // broker resolves `deny_stop` exactly like `deny`; aborting the turn is
+        // ours to do, and only once something actually resolved. Idempotent, so
+        // the `all` loop aborting on its first success is fine.
+        if (resolved && permAction === 'deny_stop') abortActiveTask(msg.address);
+        return resolved;
+      };
 
       if (permTarget === 'all') {
         if (pendingPerms.length === 0) {
@@ -1024,9 +1085,9 @@ async function handleCommand(
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
-        '/perm allow|allow_session|deny all - Respond to every pending request',
+        '/perm allow|allow_session|deny|deny_stop all - Respond to every pending request',
         '/perm list - List pending permission requests',
-        '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
+        '1/2/3/4 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
         '/help - Show this help',
       ].join('\n');
       break;

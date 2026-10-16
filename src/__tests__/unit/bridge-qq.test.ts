@@ -683,7 +683,7 @@ describe('numeric shortcut permission replies', () => {
     });
 
     assert.equal(sentMessages.length, 1, 'Should reply with confirmation');
-    assert.ok(sentMessages[0].text.includes('Allow'), 'Should confirm Allow');
+    assert.ok(sentMessages[0].text.includes('Allowed. Claude is continuing this turn.'), 'Should confirm Allow');
     assert.equal(store.permLinks.get('perm-abc').resolved, true, 'Permission should be resolved');
   });
 
@@ -714,7 +714,10 @@ describe('numeric shortcut permission replies', () => {
     });
 
     assert.equal(sentMessages.length, 1);
-    assert.ok(sentMessages[0].text.includes('Allow Session'), 'Should confirm Allow Session');
+    assert.ok(
+      sentMessages[0].text.includes('Allowed for this session. Claude is continuing this turn.'),
+      'Should confirm Allow Session',
+    );
     assert.equal(store.permLinks.get('perm-def').resolved, true);
   });
 
@@ -745,8 +748,47 @@ describe('numeric shortcut permission replies', () => {
     });
 
     assert.equal(sentMessages.length, 1);
-    assert.ok(sentMessages[0].text.includes('Deny'), 'Should confirm Deny');
+    // A plain deny must say the turn keeps running — that is the whole point
+    // of it being distinct from "4" / Deny & Stop.
+    assert.ok(
+      sentMessages[0].text.includes('Denied this tool call. Claude keeps working on the current turn'),
+      'Should confirm Deny and warn the turn continues',
+    );
     assert.equal(store.permLinks.get('perm-ghi').resolved, true);
+  });
+
+  it('resolves single pending permission with "4" → deny_stop (qq)', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    store.permLinks.set('perm-stop', {
+      permissionRequestId: 'perm-stop',
+      chatId: 'user-1',
+      messageId: 'msg-1',
+      resolved: false,
+      suggestions: '',
+    });
+
+    const sentMessages: OutboundMessage[] = [];
+    const adapter = createMockQQAdapter({
+      sendFn: async (msg) => {
+        sentMessages.push(msg);
+        return { ok: true, messageId: 'reply-1' };
+      },
+    });
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'user-reply-4',
+      address: { channelType: 'qq' as const, chatId: 'user-1', userId: 'user-1' },
+      text: '4',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(sentMessages.length, 1);
+    assert.ok(
+      sentMessages[0].text.includes('Denied this tool call and stopping the current turn'),
+      'Should confirm Deny & Stop',
+    );
+    assert.equal(store.permLinks.get('perm-stop').resolved, true);
   });
 
   it('handles fullwidth digit ２ via NFKC normalization', async () => {
@@ -776,7 +818,10 @@ describe('numeric shortcut permission replies', () => {
     });
 
     assert.equal(sentMessages.length, 1, 'Should handle fullwidth digit');
-    assert.ok(sentMessages[0].text.includes('Allow Session'), 'Fullwidth ２ should map to allow_session');
+    assert.ok(
+      sentMessages[0].text.includes('Allowed for this session.'),
+      'Fullwidth ２ should map to allow_session',
+    );
     assert.equal(store.permLinks.get('perm-fw').resolved, true);
   });
 
@@ -807,7 +852,7 @@ describe('numeric shortcut permission replies', () => {
     });
 
     assert.equal(sentMessages.length, 1, 'Should handle digit with zero-width chars');
-    assert.ok(sentMessages[0].text.includes('Allow'), 'Should map to allow');
+    assert.ok(sentMessages[0].text.includes('Allowed. Claude is continuing this turn.'), 'Should map to allow');
     assert.equal(store.permLinks.get('perm-zw').resolved, true);
   });
 
@@ -817,7 +862,7 @@ describe('numeric shortcut permission replies', () => {
     assert.equal(pendingLinks.length, 0, 'No pending permissions');
     // The bridge-manager code checks: pendingLinks.length === 1
     // With 0 pending, it falls through to normal message handling
-    const shouldIntercept = /^[123]$/.test('1') && (pendingLinks.length as number) === 1;
+    const shouldIntercept = /^[1234]$/.test('1') && (pendingLinks.length as number) === 1;
     assert.equal(shouldIntercept, false, 'Should not intercept "1" when no pending permissions');
   });
 
