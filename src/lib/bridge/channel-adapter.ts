@@ -116,6 +116,20 @@ export abstract class BaseChannelAdapter {
    * Returns true if a card was finalized (caller should skip normal delivery).
    */
   onStreamEnd?(_chatId: string, _status: 'completed' | 'interrupted' | 'error', _responseText: string): Promise<boolean>;
+
+  /**
+   * Called right before something is posted below the streaming card —
+   * currently a permission prompt. The adapter should finalize the current
+   * card and drop its state, so the rest of the turn streams into a fresh
+   * card that lands *below* that message.
+   *
+   * Cards keep the position where they were created, so without this the
+   * post-approval output would keep updating a card that now sits above the
+   * prompt, and reading the answer would mean scrolling back up past it.
+   *
+   * Returns true if a card was finalized.
+   */
+  onStreamBreak?(_chatId: string): Promise<boolean>;
 }
 
 // ── Adapter Registry ────────────────────────────────────────────

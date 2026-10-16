@@ -539,7 +539,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
    */
   private async finalizeCard(
     chatId: string,
-    status: 'completed' | 'interrupted' | 'error',
+    status: 'completed' | 'interrupted' | 'error' | 'paused',
     responseText: string,
   ): Promise<boolean> {
     // Wait for in-flight card creation to complete before finalizing
@@ -578,6 +578,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         completed: '✅ Completed',
         interrupted: '⚠️ Interrupted',
         error: '❌ Error',
+        paused: '⏸ Waiting for permission',
       };
       const elapsedMs = Date.now() - state.startTime;
       const footer = {
@@ -652,6 +653,25 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean> {
     return this.finalizeCard(chatId, status, responseText);
+  }
+
+  /**
+   * Finalize the card this turn has been streaming into and drop its state, so
+   * the rest of the turn opens a fresh card below whatever was just posted.
+   *
+   * The card is created at turn start, so a permission prompt — posted later —
+   * always lands underneath it. Without this break the post-approval output
+   * keeps updating that earlier card and the answer ends up above the prompt,
+   * forcing a scroll back up to read it.
+   *
+   * finalizeCard clears activeCards in its finally block, so the next
+   * onStreamText creates a new card. Whatever had streamed so far stays in the
+   * old one; the answer starts clean in the new one.
+   */
+  async onStreamBreak(chatId: string): Promise<boolean> {
+    const state = this.activeCards.get(chatId);
+    if (!state) return false;
+    return this.finalizeCard(chatId, 'paused', state.pendingText || '');
   }
 
   // ── Send ────────────────────────────────────────────────────

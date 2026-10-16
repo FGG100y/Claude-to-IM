@@ -745,6 +745,18 @@ async function handleMessage(
     const promptText = text || (hasAttachments ? 'Describe this image.' : '');
 
     const result = await engine.processMessage(binding, promptText, async (perm) => {
+      // Close this turn's streaming card before the prompt is posted. A card
+      // keeps the position where it was created, so the prompt always lands
+      // below it — leaving the post-approval output to stream into a card the
+      // user would have to scroll back up past to read.
+      if (hasStreamingCards && adapter.onStreamBreak) {
+        try {
+          await adapter.onStreamBreak(msg.address.chatId);
+        } catch (err) {
+          console.warn('[bridge-manager] Stream break failed:', err instanceof Error ? err.message : err);
+        }
+      }
+
       await broker.forwardPermissionRequest(
         adapter,
         msg.address,
