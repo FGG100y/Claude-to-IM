@@ -23,6 +23,24 @@ import { escapeHtml } from './adapters/telegram-utils.js';
 const recentPermissionForwards = new Map<string, number>();
 
 /**
+ * What the model receives as the tool result when the user declines.
+ *
+ * A bare "denied" is ambiguous — it reads as "this tool is unavailable"
+ * rather than "this action is off-limits", so the model just reaches the same
+ * target another way (denying a Read of a file makes it run `cat` on it).
+ * The denial also lands in the session history, so that misreading sticks for
+ * the rest of the session and the card is never shown again.
+ *
+ * So state what was refused, forbid the workaround, and leave a legitimate
+ * way out: say why, rather than silently routing around the refusal.
+ */
+const DENY_MESSAGE =
+  'The user declined this action from their chat client. Do not try to ' +
+  'achieve the same result with a different tool or command — treat the ' +
+  'target as off-limits. Continue with the rest of the task; if this ' +
+  'action is essential, say why instead of working around the refusal.';
+
+/**
  * Forward a permission request to an IM channel as an interactive message.
  */
 export async function forwardPermissionRequest(
@@ -252,7 +270,7 @@ export function handlePermissionCallback(
       // in-flight turn once this returns true.
       resolved = permissions.resolvePendingPermission(permissionRequestId, {
         behavior: 'deny',
-        message: 'Denied via IM bridge',
+        message: DENY_MESSAGE,
       });
       break;
 

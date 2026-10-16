@@ -155,7 +155,19 @@ describe('permission-broker', () => {
     const result = handlePermissionCallback('perm:deny:perm-2', '456');
     assert.ok(result);
     assert.equal(gateway.resolved[0].resolution.behavior, 'deny');
-    assert.equal(gateway.resolved[0].resolution.message, 'Denied via IM bridge');
+
+    // The message is model-facing: it has to rule out the workaround, or the
+    // model reads the denial as "this tool is broken" and reaches the same
+    // target with another one. Assert the instruction, not the exact copy.
+    const message = gateway.resolved[0].resolution.message as string;
+    assert.ok(
+      message.includes('Do not try to achieve the same result with a different tool'),
+      'deny message must forbid working around the refusal',
+    );
+    assert.ok(
+      message.includes('say why instead of working around'),
+      'deny message must leave the model a way to speak up',
+    );
   });
 
   it('prevents duplicate resolution', () => {
