@@ -108,6 +108,21 @@ describe('permission-broker', () => {
     assert.equal(handlePermissionCallback('perm:allow:unknown-id', '123'), false);
   });
 
+  it('rejects an unknown action without claiming the permission link', () => {
+    store.links.set('perm-unknown', {
+      chatId: '123',
+      messageId: 'msg-1',
+      resolved: false,
+      suggestions: '',
+    });
+
+    assert.equal(handlePermissionCallback('perm:bogus:perm-unknown', '123'), false);
+    // Claiming the link before validating the action would strand the pending
+    // promise until the 5-minute timeout and make the request unretryable.
+    assert.equal(store.links.get('perm-unknown')!.resolved, false);
+    assert.equal(gateway.resolved.length, 0);
+  });
+
   it('returns false when chatId does not match', () => {
     store.links.set('perm-1', {
       chatId: '999',

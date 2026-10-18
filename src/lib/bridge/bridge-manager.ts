@@ -60,18 +60,18 @@ function getStreamConfig(channelType = 'telegram'): StreamConfig {
 }
 
 /**
- * Check if a message looks like a numeric permission shortcut (1/2/3) for
- * feishu/qq channels WITH at least one pending permission in that chat.
+ * Check if a message looks like a numeric permission shortcut (1/2/3/4) for
+ * feishu/qq/weixin channels WITH at least one pending permission in that chat.
  *
  * This is used by the adapter loop to route these messages to the inline
  * (non-session-locked) path, avoiding deadlock: the session is blocked
- * waiting for the permission to be resolved, so putting "1" behind the
- * session lock would deadlock.
+ * waiting for the permission to be resolved, so putting "1" (or "4") behind
+ * the session lock would deadlock.
  */
 function isNumericPermissionShortcut(channelType: string, rawText: string, chatId: string): boolean {
   if (channelType !== 'feishu' && channelType !== 'qq' && channelType !== 'weixin') return false;
   const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-  if (!/^[123]$/.test(normalized)) return false;
+  if (!broker.permissionActionForShortcut(normalized)) return false;
   const { store } = getBridgeContext();
   const pending = store.listPendingPermissionLinksByChat(chatId);
   return pending.length > 0; // any pending → route to inline path
@@ -388,10 +388,11 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
         // lightweight — process inline (outside session lock).
         // Regular messages use per-session locking for concurrency.
         //
-        // IMPORTANT: numeric shortcuts (1/2/3) for feishu/qq MUST run outside
-        // the session lock. The current session is blocked waiting for the
-        // permission to be resolved; if "1" enters the session lock queue it
-        // deadlocks (permission waits for "1", "1" waits for lock release).
+        // IMPORTANT: numeric shortcuts (1/2/3/4) for feishu/qq/weixin MUST run
+        // outside the session lock. The current session is blocked waiting for
+        // the permission to be resolved; if "1" (or "4") enters the session
+        // lock queue it deadlocks (permission waits for "1", "1" waits for
+        // lock release).
         if (
           msg.callbackData ||
           msg.text.trim().startsWith('/') ||
@@ -569,16 +570,11 @@ async function handleMessage(
   ) {
     // eslint-disable-next-line no-control-regex
     const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-    if (/^[1234]$/.test(normalized)) {
+    const shortcutAction = broker.permissionActionForShortcut(normalized);
+    if (shortcutAction) {
       const pendingLinks = store.listPendingPermissionLinksByChat(msg.address.chatId);
       if (pendingLinks.length === 1) {
-        const actionMap: Record<string, string> = {
-          '1': 'allow',
-          '2': 'allow_session',
-          '3': 'deny',
-          '4': 'deny_stop',
-        };
-        const action = actionMap[normalized];
+        const action = shortcutAction;
         const permId = pendingLinks[0].permissionRequestId;
         // Shares the callback path so `4` aborts the turn the same way the
         // "Deny & Stop" button does.
@@ -606,7 +602,7 @@ async function handleMessage(
         return;
       }
       // pendingLinks.length === 0: no pending permissions, fall through as normal message
-    } else if (rawText !== normalized && /^[1234]$/.test(rawText) === false) {
+    } else if (rawText !== normalized && !broker.permissionActionForShortcut(rawText)) {
       // Log when normalization changed the text — helps diagnose encoding issues
       const codePoints = [...rawText].map(c => 'U+' + c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0'));
       console.log(`[bridge-manager] Shortcut candidate raw codepoints: ${codePoints.join(' ')} → normalized: "${normalized}"`);
@@ -1039,7 +1035,7 @@ async function handleCommand(
       }
 
       const permTarget = permParts.slice(1).join(' ').trim();
-      if (!permTarget || !['allow', 'allow_session', 'deny', 'deny_stop'].includes(permAction)) {
+      if (!permTarget || !broker.isPermissionAction(permAction)) {
         response = 'Usage: /perm list | /perm allow|allow_session|deny|deny_stop &lt;number|id|all&gt;';
         break;
       }
@@ -1144,6 +1140,7 @@ export function computeSdkSessionUpdate(
 
 // ── Test-only export ─────────────────────────────────────────
 // Exposed so integration tests can exercise handleMessage directly
-// without wiring up the full adapter loop.
+// without wiring up the full adapter loop. The shortcut router is exported
+// too: its "4" handling is what keeps deny_stop out of the session lock.
 /** @internal */
-export const _testOnly = { handleMessage };
+export const _testOnly = { handleMessage, isNumericPermissionShortcut };

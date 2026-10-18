@@ -655,6 +655,28 @@ describe('numeric shortcut permission replies', () => {
     delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
   });
 
+  it('routes "4" through the inline path for feishu/qq/weixin', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    store.permLinks.set('perm-route', {
+      permissionRequestId: 'perm-route',
+      chatId: 'user-1',
+      messageId: 'msg-1',
+      resolved: false,
+      suggestions: '',
+    });
+
+    for (const channelType of ['feishu', 'qq', 'weixin']) {
+      assert.equal(
+        _testOnly.isNumericPermissionShortcut(channelType, '4', 'user-1'),
+        true,
+        `${channelType} must route "4" inline; otherwise it queues behind the session lock`,
+      );
+    }
+    assert.equal(_testOnly.isNumericPermissionShortcut('telegram', '4', 'user-1'), false);
+    assert.equal(_testOnly.isNumericPermissionShortcut('feishu', '5', 'user-1'), false);
+  });
+
   it('resolves single pending permission with "1" → allow (qq)', async () => {
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
 

@@ -17,6 +17,32 @@ import { getBridgeContext } from './context.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
 
 /**
+ * The complete permission action set. `bridge-manager` (card callbacks, `/perm`,
+ * numeric shortcuts) and this broker must agree on it; keep this as the single
+ * source of truth instead of duplicating string arrays in both files.
+ */
+export const PERMISSION_ACTIONS = ['allow', 'allow_session', 'deny', 'deny_stop'] as const;
+export type PermissionAction = (typeof PERMISSION_ACTIONS)[number];
+
+/** Numeric shortcut → action, shared by the router and the inline handler. */
+export const PERMISSION_SHORTCUTS: Record<string, PermissionAction> = {
+  '1': 'allow',
+  '2': 'allow_session',
+  '3': 'deny',
+  '4': 'deny_stop',
+};
+
+export function isPermissionAction(value: string): value is PermissionAction {
+  return (PERMISSION_ACTIONS as readonly string[]).includes(value);
+}
+
+export function permissionActionForShortcut(text: string): PermissionAction | undefined {
+  return Object.prototype.hasOwnProperty.call(PERMISSION_SHORTCUTS, text)
+    ? PERMISSION_SHORTCUTS[text]
+    : undefined;
+}
+
+/**
  * Dedup recent permission forwards to prevent duplicate cards.
  * Key: permissionRequestId, value: timestamp. Entries expire after 30s.
  */
@@ -198,6 +224,14 @@ export function handlePermissionCallback(
   if (!parsed) return false;
 
   const { action, permissionRequestId } = parsed;
+
+  // Validate the action BEFORE claiming the link. Otherwise an unknown action
+  // would mark the permission resolved (below) without resolving the pending
+  // promise, leaving the turn to hang until the 5-minute timeout.
+  if (!isPermissionAction(action)) {
+    console.warn(`[permission-broker] Unknown permission action: ${action}`);
+    return false;
+  }
 
   // Look up the permission link to validate origin and check dedup
   const link = store.getPermissionLink(permissionRequestId);
