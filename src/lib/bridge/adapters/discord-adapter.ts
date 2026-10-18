@@ -38,6 +38,17 @@ const TYPING_INTERVAL_MS = 8000;
 /** Interaction TTL for answerCallback (60s). */
 const INTERACTION_TTL_MS = 60_000;
 
+/** Gateway heartbeat log interval (5 min). */
+const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+
+/**
+ * Diagnostic line with an explicit timestamp — raw console output has no
+ * timestamp prefix, so a heartbeat gap can't otherwise be placed in time.
+ */
+function diag(level: 'log' | 'warn' | 'error', msg: string): void {
+  console[level](`[${new Date().toISOString()}] [discord-adapter] ${msg}`);
+}
+
 /**
  * Lazily loaded discord.js module reference.
  * Populated in start() via dynamic import to avoid bundler issues.
@@ -62,6 +73,7 @@ export class DiscordAdapter extends BaseChannelAdapter {
   private waiters: Array<(msg: InboundMessage | null) => void> = [];
   private seenMessageIds = new Set<string>();
   private botUserId: string | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
   /** Temporary storage for Interaction objects (for answerCallback). */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -113,6 +125,49 @@ export class DiscordAdapter extends BaseChannelAdapter {
       });
     });
 
+    // ── Gateway lifecycle diagnostics ────────────────────────────
+    // Inbound messages have been observed to vanish without a trace: no audit
+    // row, no handler error. Since the audit row is written before any filter,
+    // that means MESSAGE_CREATE never reached this process. These listeners
+    // record every gateway transition, so a lost message can be attributed to
+    // a disconnect (and whether the session resumed and replayed events) rather
+    // than guessed at. Event names: discord.js v14 Client events.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this.client.on('error', (err: any) => {
+      diag('error', `client error: ${err?.message || err}`);
+    });
+    this.client.on('warn', (msg: string) => {
+      diag('warn', `client warn: ${msg}`);
+    });
+    this.client.on('invalidated', () => {
+      diag('error', 'gateway session INVALIDATED — events sent during the gap are LOST');
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this.client.on('shardDisconnect', (ev: any, id: number) => {
+      diag('warn', `shard ${id} DISCONNECT code=${ev?.code} reason=${ev?.reason || ''}`);
+    });
+    this.client.on('shardReconnecting', (id: number) => {
+      diag('warn', `shard ${id} RECONNECTING`);
+    });
+    this.client.on('shardResume', (id: number, replayed: number) => {
+      diag('log', `shard ${id} RESUMED (replayed events: ${replayed})`);
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this.client.on('shardError', (err: any, id: number) => {
+      diag('error', `shard ${id} error: ${err?.message || err}`);
+    });
+    this.client.on('shardReady', (id: number) => {
+      diag('log', `shard ${id} READY`);
+    });
+
+    // Heartbeat: proves the event loop is still turning. A gap in these lines
+    // while Discord stayed up means the process was wedged, not that the
+    // gateway dropped — the two failure modes need different fixes.
+    this.heartbeatTimer = setInterval(() => {
+      const ping = this.client?.ws?.ping;
+      diag('log', `heartbeat wsPing=${typeof ping === 'number' ? `${ping}ms` : 'n/a'} queued=${this.queue.length} pendingInteractions=${this.pendingInteractions.size} running=${this.running}`);
+    }, HEARTBEAT_INTERVAL_MS);
+
     // Login and wait for ready
     await this.client.login(token);
 
@@ -132,6 +187,13 @@ export class DiscordAdapter extends BaseChannelAdapter {
   }
 
   async stop(): Promise<void> {
+    // Clear the heartbeat before the early return: start() creates it before
+    // login(), so a failed start still leaves a live timer behind.
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+
     if (!this.running) return;
     this.running = false;
 
@@ -417,12 +479,24 @@ export class DiscordAdapter extends BaseChannelAdapter {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async processMessage(message: any): Promise<void> {
+    // Receipt log — first line, ahead of every filter, so "Discord delivered it
+    // but the bridge dropped it" stays distinguishable from "it never arrived".
+    diag(
+      'log',
+      `recv id=${message.id} ch=${message.channelId} user=${message.author?.id}`
+      + ` isBot=${!!message.author?.bot} mentions=${message.mentions?.users?.size ?? 0}`
+      + ` len=${(message.content || '').length} text=${JSON.stringify((message.content || '').slice(0, 80))}`,
+    );
+
     // Filter out bot messages (including self)
     if (message.author.bot) return;
     if (this.botUserId && message.author.id === this.botUserId) return;
 
     // Dedup by message ID
-    if (this.seenMessageIds.has(message.id)) return;
+    if (this.seenMessageIds.has(message.id)) {
+      diag('warn', `DROP duplicate id=${message.id}`);
+      return;
+    }
     this.addToDedup(message.id);
 
     const chatId = message.channelId;
@@ -431,7 +505,10 @@ export class DiscordAdapter extends BaseChannelAdapter {
     const isGuild = !!message.guild;
 
     // Authorization check
-    if (!this.isAuthorized(userId, chatId)) return;
+    if (!this.isAuthorized(userId, chatId)) {
+      diag('warn', `DROP unauthorized user=${userId} ch=${chatId}`);
+      return;
+    }
 
     // Guild (server) message policy
     if (isGuild) {
@@ -439,12 +516,14 @@ export class DiscordAdapter extends BaseChannelAdapter {
         .split(',').map(s => s.trim()).filter(Boolean);
 
       if (allowedGuilds.length > 0 && !allowedGuilds.includes(message.guild!.id)) {
+        diag('warn', `DROP guild not in allowlist guild=${message.guild!.id}`);
         return;
       }
 
       const policy = getBridgeContext().store.getSetting('bridge_discord_group_policy') || 'open';
 
       if (policy === 'disabled') {
+        diag('warn', `DROP group policy disabled ch=${chatId}`);
         return;
       }
 
