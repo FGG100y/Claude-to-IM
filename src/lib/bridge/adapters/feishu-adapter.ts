@@ -59,10 +59,18 @@ interface FeishuCardState {
   pendingText: string | null;
   lastUpdateAt: number;
   throttleTimer: ReturnType<typeof setTimeout> | null;
+  /** New content arrived since the last successful send. */
+  dirty: boolean;
+  /** Only one cardElement.content request may be in flight at a time. */
+  inFlight: boolean;
+  inFlightPromise: Promise<void> | null;
 }
 
-/** Streaming card throttle interval (ms). */
-const CARD_THROTTLE_MS = 200;
+/** Streaming card throttle interval (ms). CardKit rejects bursts with 99991400. */
+const CARD_THROTTLE_MS = 1000;
+
+/** Backoff after a 99991400 / other transient card update failure. */
+const CARD_RETRY_MS = 2000;
 
 /** element_id of the markdown element that receives streamed content. */
 const STREAMING_ELEMENT_ID = 'streaming_content';
@@ -455,6 +463,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
         pendingText: null,
         lastUpdateAt: 0,
         throttleTimer: null,
+        dirty: false,
+        inFlight: false,
+        inFlightPromise: null,
       });
 
       console.log(`[feishu-adapter] Streaming card created: cardId=${cardId}, msgId=${messageId}`);
@@ -468,6 +479,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   /**
    * Update streaming card content with throttling.
+   *
+   * CardKit's cardElement.content endpoint rejects bursts with
+   * `99991400 request trigger frequency limit`. Keep one request in flight,
+   * coalesce intermediate text, and back off after a failure instead of
+   * retrying on every SSE chunk (which produced a tight failure loop).
    */
   private updateCardContent(chatId: string, text: string): void {
     const state = this.activeCards.get(chatId);
@@ -478,16 +494,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
       state.thinking = false;
     }
     state.pendingText = text;
+    state.dirty = true;
+
+    // A request is already in flight — let its completion schedule the next
+    // flush with the latest text.
+    if (state.inFlight) return;
 
     const elapsed = Date.now() - state.lastUpdateAt;
     if (elapsed < CARD_THROTTLE_MS && state.lastUpdateAt > 0) {
-      // Schedule trailing-edge flush
-      if (!state.throttleTimer) {
-        state.throttleTimer = setTimeout(() => {
-          state.throttleTimer = null;
-          this.flushCardUpdate(chatId);
-        }, CARD_THROTTLE_MS - elapsed);
-      }
+      this.scheduleCardFlush(chatId, CARD_THROTTLE_MS - elapsed);
       return;
     }
 
@@ -499,28 +514,57 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.flushCardUpdate(chatId);
   }
 
+  /** Schedule a single trailing-edge flush, keeping the earliest deadline. */
+  private scheduleCardFlush(chatId: string, delayMs: number): void {
+    const state = this.activeCards.get(chatId);
+    if (!state) return;
+    if (state.throttleTimer) return;
+    state.throttleTimer = setTimeout(() => {
+      state.throttleTimer = null;
+      this.flushCardUpdate(chatId);
+    }, Math.max(0, delayMs));
+  }
+
   /**
    * Flush pending card update to Feishu API.
    */
   private flushCardUpdate(chatId: string): void {
     const state = this.activeCards.get(chatId);
-    if (!state || !this.restClient) return;
+    if (!state || !this.restClient || state.inFlight) return;
+    if (!state.dirty && state.sequence > 0) return;
 
     const content = buildStreamingContent(state.pendingText || '', state.toolCalls);
 
     state.sequence++;
     const seq = state.sequence;
     const cardId = state.cardId;
+    state.dirty = false;
+    state.inFlight = true;
 
-    // Fire-and-forget — streaming updates are non-critical
-    this.restClient.cardkit.v1.cardElement.content({
+    // Fire-and-forget — streaming updates are non-critical, but keep exactly
+    // one in flight so a slow/rate-limited API cannot build a retry storm.
+    const request = this.restClient.cardkit.v1.cardElement.content({
       path: { card_id: cardId, element_id: STREAMING_ELEMENT_ID },
       data: { content, sequence: seq },
     }).then(() => {
       state.lastUpdateAt = Date.now();
+      state.inFlight = false;
+      state.inFlightPromise = null;
+      if (state.dirty) this.scheduleCardFlush(chatId, CARD_THROTTLE_MS);
     }).catch((err: unknown) => {
-      console.warn('[feishu-adapter] streamContent failed:', err instanceof Error ? err.message : err);
+      const code = (err as { response?: { data?: { code?: number } } })?.response?.data?.code;
+      state.lastUpdateAt = Date.now();
+      state.inFlight = false;
+      state.inFlightPromise = null;
+      console.warn(
+        `[feishu-adapter] streamContent failed${code ? ` (code ${code})` : ''}:`,
+        err instanceof Error ? err.message : err,
+      );
+      // Keep the final content for the next attempt; back off so a rate-limited
+      // card does not turn every SSE chunk into another request.
+      if (state.dirty) this.scheduleCardFlush(chatId, code === 99991400 ? CARD_RETRY_MS * 2 : CARD_RETRY_MS);
     });
+    state.inFlightPromise = request;
   }
 
   /**
@@ -555,6 +599,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (state.throttleTimer) {
       clearTimeout(state.throttleTimer);
       state.throttleTimer = null;
+    }
+
+    // Let the current content update finish (bounded) before changing the card
+    // mode; otherwise the streaming update can land after the final content.
+    if (state.inFlightPromise) {
+      await Promise.race([
+        state.inFlightPromise,
+        new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+      ]);
     }
 
     // Step 1: Close streaming mode. Kept outside the main try so a failure here
