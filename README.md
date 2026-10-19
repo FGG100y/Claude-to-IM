@@ -16,7 +16,7 @@ Claude-to-IM was extracted from CodePilot as a standalone library for developers
 
 - **Multi-platform adapters**: Telegram (long polling), Discord (Gateway WebSocket), Feishu/Lark (WSClient)
 - **Streaming previews**: Real-time response drafts via message editing, with per-platform throttling
-- **Permission management**: Interactive inline buttons for Claude Code tool approvals (allow / deny / allow for session)
+- **Permission management**: Interactive inline buttons for Claude Code tool approvals (allow / deny / allow for session / deny & stop), Feishu batch cards for subagent bursts, and soft turn cancellation with a non-reviving message queue
 - **Session binding**: Each IM chat maps to a persistent conversation session with working directory and model settings
 - **Markdown rendering**: Platform-native formatting — HTML for Telegram, Discord-flavored Markdown, Feishu rich text cards
 - **Reliable delivery**: Auto-chunking at platform limits, retry with exponential backoff, HTML fallback on parse errors, message deduplication
@@ -200,7 +200,9 @@ src/
   __tests__/unit/
     bridge-channel-router.test.ts
     bridge-delivery-layer.test.ts
+    bridge-feishu-card.test.ts
     bridge-manager.test.ts
+    bridge-stop-queue.test.ts
     bridge-permission-broker.test.ts
 ```
 
@@ -210,7 +212,7 @@ src/
 # Type checking
 npm run typecheck
 
-# Unit tests (28 tests)
+# Unit tests (92 tests)
 npm run test:unit
 
 # Both

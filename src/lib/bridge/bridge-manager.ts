@@ -167,10 +167,23 @@ interface BridgeManagerState {
   startedAt: string | null;
   loopAborts: Map<string, AbortController>;
   activeTasks: Map<string, AbortController>;
+  /** Wall-clock start of the active turn, used by /status. */
+  activeTaskStartedAt: Map<string, number>;
+  /**
+   * Per-session epoch. `/stop` (and `deny_stop`) bumps it so messages that
+   * were already queued behind the cancelled turn are dropped instead of
+   * starting a fresh turn after the abort.
+   */
+  sessionEpochs: Map<string, number>;
+  /** Regular messages currently waiting on the session lock. */
+  queuedTurns: Map<string, number>;
   /** Per-session processing chains for concurrency control */
   sessionLocks: Map<string, Promise<void>>;
   autoStartChecked: boolean;
 }
+
+/** At most this many regular messages may wait behind one active turn. */
+const MAX_QUEUED_TURNS = 3;
 
 function getState(): BridgeManagerState {
   const g = globalThis as unknown as Record<string, BridgeManagerState>;
@@ -182,15 +195,76 @@ function getState(): BridgeManagerState {
       startedAt: null,
       loopAborts: new Map(),
       activeTasks: new Map(),
+      activeTaskStartedAt: new Map(),
+      sessionEpochs: new Map(),
+      queuedTurns: new Map(),
       sessionLocks: new Map(),
       autoStartChecked: false,
     };
   }
-  // Backfill sessionLocks for states created before this field existed
-  if (!g[GLOBAL_KEY].sessionLocks) {
-    g[GLOBAL_KEY].sessionLocks = new Map();
-  }
-  return g[GLOBAL_KEY];
+  // Backfill fields for states created before they existed (HMR).
+  const state = g[GLOBAL_KEY];
+  if (!state.sessionLocks) state.sessionLocks = new Map();
+  if (!state.activeTaskStartedAt) state.activeTaskStartedAt = new Map();
+  if (!state.sessionEpochs) state.sessionEpochs = new Map();
+  if (!state.queuedTurns) state.queuedTurns = new Map();
+  return state;
+}
+
+/**
+ * Normalize text before command detection: full-width slash/digits, zero-width
+ * joiners and other Unicode variants. Mobile Feishu clients occasionally insert
+ * these, which used to turn `/stop` into a regular queued message.
+ */
+function normalizeCommandText(text: string): string {
+  return text
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .trim();
+}
+
+function sessionEpoch(sessionId: string): number {
+  return getState().sessionEpochs.get(sessionId) ?? 0;
+}
+
+function bumpSessionEpoch(sessionId: string): number {
+  const state = getState();
+  const next = (state.sessionEpochs.get(sessionId) ?? 0) + 1;
+  state.sessionEpochs.set(sessionId, next);
+  return next;
+}
+
+function queuedTurnCount(sessionId: string): number {
+  return getState().queuedTurns.get(sessionId) ?? 0;
+}
+
+function formatElapsedMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  const rem = sec % 60;
+  return rem > 0 ? `${min}m ${rem}s` : `${min}m`;
+}
+
+function ackInbound(adapter: BaseChannelAdapter, msg: InboundMessage): void {
+  if (msg.updateId != null) adapter.acknowledgeUpdate?.(msg.updateId);
+}
+
+function auditDroppedTurn(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  reason: string,
+): void {
+  try {
+    getBridgeContext().store.insertAuditLog({
+      channelType: adapter.channelType,
+      chatId: msg.address.chatId,
+      direction: 'inbound',
+      messageId: msg.messageId,
+      summary: `[DROPPED] ${reason}`,
+    });
+  } catch { /* best effort */ }
 }
 
 /**
@@ -393,21 +467,15 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
         // the permission to be resolved; if "1" (or "4") enters the session
         // lock queue it deadlocks (permission waits for "1", "1" waits for
         // lock release).
+        const commandText = normalizeCommandText(msg.text);
         if (
           msg.callbackData ||
-          msg.text.trim().startsWith('/') ||
-          isNumericPermissionShortcut(adapter.channelType, msg.text.trim(), msg.address.chatId)
+          commandText.startsWith('/') ||
+          isNumericPermissionShortcut(adapter.channelType, commandText, msg.address.chatId)
         ) {
           await handleMessage(adapter, msg);
         } else {
-          const binding = router.resolve(msg.address);
-          // Fire-and-forget into session lock — loop continues to accept
-          // messages for other sessions immediately.
-          processWithSessionLock(binding.codepilotSessionId, () =>
-            handleMessage(adapter, msg),
-          ).catch(err => {
-            console.error(`[bridge-manager] Session ${binding.codepilotSessionId.slice(0, 8)} error:`, err);
-          });
+          queueRegularTurn(adapter, msg);
         }
       } catch (err) {
         if (abort.signal.aborted) break;
@@ -433,20 +501,78 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
 }
 
 /**
+ * Queue a regular message behind the session's active turn.
+ *
+ * Each queued turn captures the session epoch. `/stop` bumps the epoch before
+ * aborting, so anything already queued is discarded instead of becoming a new
+ * turn after the abort ("the agent restarted itself" incident).
+ */
+function queueRegularTurn(adapter: BaseChannelAdapter, msg: InboundMessage): void {
+  const state = getState();
+  const binding = router.resolve(msg.address);
+  const sessionId = binding.codepilotSessionId;
+  const epoch = sessionEpoch(sessionId);
+
+  if (queuedTurnCount(sessionId) >= MAX_QUEUED_TURNS) {
+    dropQueuedTurn(adapter, msg, 'queue full; send /status or /stop');
+    return;
+  }
+
+  state.queuedTurns.set(sessionId, queuedTurnCount(sessionId) + 1);
+
+  // Fire-and-forget into session lock — loop continues to accept
+  // messages for other sessions immediately.
+  processWithSessionLock(sessionId, async () => {
+    state.queuedTurns.set(sessionId, Math.max(0, queuedTurnCount(sessionId) - 1));
+
+    if (sessionEpoch(sessionId) !== epoch) {
+      dropQueuedTurn(adapter, msg, 'cancelled by /stop (stale session epoch)');
+      return;
+    }
+
+    await handleMessage(adapter, msg);
+  }).catch(err => {
+    console.error(`[bridge-manager] Session ${sessionId.slice(0, 8)} error:`, err);
+  });
+}
+
+/**
+ * Drop a queued message, acknowledge its update offset, and tell the user why.
+ * Deliberately does not start a new turn.
+ */
+function dropQueuedTurn(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  reason: string,
+): void {
+  ackInbound(adapter, msg);
+  auditDroppedTurn(adapter, msg, `queued message dropped: ${reason}`);
+  void deliver(adapter, {
+    address: msg.address,
+    text: `Queued message cancelled: ${reason}. Send /status for progress or /stop to cancel the current turn.`,
+    parseMode: 'plain',
+    replyToMessageId: msg.messageId,
+  }).catch(() => { /* best effort */ });
+}
+
+/**
  * Abort the turn currently running for this chat, if any. Mirrors `/stop`.
  */
-function abortActiveTask(address: InboundMessage['address']): void {
+function abortActiveTask(address: InboundMessage['address']): boolean {
   try {
     const binding = router.resolve(address);
-    const activeTasks = getState().activeTasks;
-    const taskAbort = activeTasks.get(binding.codepilotSessionId);
+    const state = getState();
+    const taskAbort = state.activeTasks.get(binding.codepilotSessionId);
     if (taskAbort) {
       taskAbort.abort();
-      activeTasks.delete(binding.codepilotSessionId);
+      state.activeTasks.delete(binding.codepilotSessionId);
+      state.activeTaskStartedAt.delete(binding.codepilotSessionId);
+      return true;
     }
   } catch (err) {
     console.warn('[bridge-manager] Failed to abort active task:', err instanceof Error ? err.message : err);
   }
+  return false;
 }
 
 /**
@@ -462,19 +588,29 @@ async function respondToPermission(
   callbackData: string,
 ): Promise<boolean> {
   const parsed = broker.parsePermissionCallback(callbackData);
-  const handled = broker.handlePermissionCallback(
+  const outcome = broker.handlePermissionCallbackDetailed(
     callbackData,
     msg.address.chatId,
     msg.callbackMessageId,
+    adapter,
   );
-  if (!handled) return false;
+  if (!outcome.handled) return false;
 
-  const confirmations: Record<string, string> = {
+  const singleConfirmations: Record<string, string> = {
     allow: 'Allowed. Claude is continuing this turn.',
     allow_session: 'Allowed for this session. Claude is continuing this turn.',
     deny: 'Denied this tool call. Claude keeps working on the current turn — send /stop to abort it.',
     deny_stop: 'Denied this tool call and stopping the current turn…',
   };
+
+  const batchConfirmations: Record<string, string> = {
+    allow: `Allowed all ${outcome.resolvedCount} pending requests. Claude is continuing this turn.`,
+    allow_session: `Allowed all ${outcome.resolvedCount} pending requests for this session. Claude is continuing this turn.`,
+    deny: `Denied all ${outcome.resolvedCount} pending requests. Claude keeps working on the current turn — send /stop to abort it.`,
+    deny_stop: `Denied all ${outcome.resolvedCount} pending requests and stopping the current turn…`,
+  };
+
+  const confirmations = outcome.kind === 'batch' ? batchConfirmations : singleConfirmations;
 
   await deliver(adapter, {
     address: msg.address,
@@ -485,10 +621,100 @@ async function respondToPermission(
   // The permission is resolved above, so the waiting canUseTool() unblocks
   // cleanly and nothing is left pending when the turn is torn down.
   if (parsed?.action === 'deny_stop') {
+    // Drop messages that were waiting behind this turn; otherwise they would
+    // start a fresh turn immediately after the abort.
+    const binding = router.resolve(msg.address);
+    bumpSessionEpoch(binding.codepilotSessionId);
     abortActiveTask(msg.address);
   }
 
   return true;
+}
+
+/**
+ * Keep only a short, single-line description of what a tool was asked to do.
+ * This is only shown for failures; successful calls are aggregated by count.
+ */
+function summarizeToolInput(toolName: string, input: unknown): string | undefined {
+  if (!input || typeof input !== 'object') return undefined;
+  const obj = input as Record<string, unknown>;
+  const pick = (...keys: string[]): unknown => {
+    for (const key of keys) {
+      if (obj[key] != null && obj[key] !== '') return obj[key];
+    }
+    return undefined;
+  };
+
+  let value: unknown;
+  switch (toolName) {
+    case 'Bash':
+      value = pick('command', 'description');
+      break;
+    case 'WebFetch':
+      value = pick('url');
+      break;
+    case 'WebSearch':
+      value = pick('query');
+      break;
+    case 'Read':
+    case 'Write':
+    case 'Edit':
+    case 'NotebookEdit':
+      value = pick('file_path', 'notebook_path', 'path');
+      break;
+    case 'Agent':
+      value = pick('description', 'prompt');
+      break;
+    default:
+      value = pick('command', 'url', 'query', 'file_path', 'description', 'prompt');
+      if (value == null) value = obj;
+      break;
+  }
+
+  if (value == null) return undefined;
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  return truncateOneLine(redactSensitive(text), 120);
+}
+
+function redactSensitive(text: string): string {
+  return text
+    .replace(/\b((?:token|secret|password|passwd|api[_-]?key)\s*[=:]\s*)[^\s,;]+/gi, '$1***')
+    .replace(/\b(Authorization\s*:\s*(?:Bearer|Basic|Token)?\s*)[^\s,;]+/gi, '$1***')
+    .replace(/(--(?:password|token|secret)\s+)[^\s,;]+/gi, '$1***');
+}
+
+function truncateOneLine(text: string, maxChars: number): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim();
+  return oneLine.length > maxChars ? oneLine.slice(0, maxChars - 1) + '…' : oneLine;
+}
+
+function classifyToolFailure(
+  result: unknown,
+  isError: boolean,
+): { kind: NonNullable<ToolCallInfo['errorKind']>; message: string } | undefined {
+  if (!isError) return undefined;
+  const raw = typeof result === 'string' ? result : JSON.stringify(result ?? '');
+  const lower = raw.toLowerCase();
+
+  let kind: NonNullable<ToolCallInfo['errorKind']> = 'tool_error';
+  if (lower.includes('permission request timed out')) {
+    kind = 'timeout';
+  } else if (
+    lower.includes('declined this action')
+    || lower.includes('user declined')
+    || lower.includes('denied via im bridge')
+    || lower.includes('permission denied')
+  ) {
+    kind = 'denied';
+  } else if (lower.includes('policy') || lower.includes('blocked by')) {
+    kind = 'policy';
+  }
+
+  const message = truncateOneLine(
+    redactSensitive(raw) || 'Tool returned an error',
+    200,
+  );
+  return { kind, message };
 }
 
 /**
@@ -523,6 +749,9 @@ async function handleMessage(
   }
 
   const rawText = msg.text.trim();
+  // Normalize before command detection: full-width slash, zero-width characters
+  // and NFKC variants must still be recognized as `/stop` etc.
+  const commandText = normalizeCommandText(msg.text);
   const hasAttachments = msg.attachments && msg.attachments.length > 0;
 
   // Handle attachment-only download failures — surface error to user instead of silently dropping
@@ -568,8 +797,9 @@ async function handleMessage(
     || adapter.channelType === 'qq'
     || adapter.channelType === 'weixin'
   ) {
-    // eslint-disable-next-line no-control-regex
-    const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    // Use the same normalization as command detection so full-width digits and
+    // zero-width joiners still map to 1/2/3/4.
+    const normalized = commandText;
     const shortcutAction = broker.permissionActionForShortcut(normalized);
     if (shortcutAction) {
       const pendingLinks = store.listPendingPermissionLinksByChat(msg.address.chatId);
@@ -610,8 +840,8 @@ async function handleMessage(
   }
 
   // Check for IM commands (before sanitization — commands are validated individually)
-  if (rawText.startsWith('/')) {
-    await handleCommand(adapter, msg, rawText);
+  if (commandText.startsWith('/')) {
+    await handleCommand(adapter, msg, commandText);
     ack();
     return;
   }
@@ -641,6 +871,7 @@ async function handleMessage(
   const taskAbort = new AbortController();
   const state = getState();
   state.activeTasks.set(binding.codepilotSessionId, taskAbort);
+  state.activeTaskStartedAt.set(binding.codepilotSessionId, Date.now());
 
   // ── Streaming preview setup ──────────────────────────────────
   let previewState: StreamingPreviewState | null = null;
@@ -715,13 +946,41 @@ async function handleMessage(
     try { adapter.onStreamText!(msg.address.chatId, fullText); } catch { /* non-critical */ }
   } : undefined;
 
-  const onToolEvent = hasStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => {
+  const onToolEvent = hasStreamingCards ? (
+    toolId: string,
+    toolName: string,
+    status: 'running' | 'complete' | 'error',
+    detail?: engine.ToolEventDetail,
+  ) => {
+    const existing = toolCallTracker.get(toolId);
     if (toolName) {
-      toolCallTracker.set(toolId, { id: toolId, name: toolName, status });
+      toolCallTracker.set(toolId, {
+        id: toolId,
+        name: toolName,
+        status,
+        inputSummary: summarizeToolInput(toolName, detail?.input) ?? existing?.inputSummary,
+      });
+    } else if (existing) {
+      // tool_result doesn't carry name — update the existing entry.
+      existing.status = status;
+      if (status === 'error') {
+        const failure = classifyToolFailure(detail?.result, detail?.isError ?? true);
+        if (failure) {
+          existing.errorKind = failure.kind;
+          existing.errorMessage = failure.message;
+        }
+      }
     } else {
-      // tool_result doesn't carry name — update existing entry's status
-      const existing = toolCallTracker.get(toolId);
-      if (existing) existing.status = status;
+      // A result without its tool_use event (e.g. resumed/unknown call).
+      const failure = status === 'error'
+        ? classifyToolFailure(detail?.result, detail?.isError ?? true)
+        : undefined;
+      toolCallTracker.set(toolId, {
+        id: toolId,
+        name: 'unknown tool',
+        status,
+        ...(failure ? { errorKind: failure.kind, errorMessage: failure.message } : {}),
+      });
     }
     try {
       adapter.onToolEvent!(msg.address.chatId, Array.from(toolCallTracker.values()));
@@ -800,13 +1059,18 @@ async function handleMessage(
     }
 
     // Persist the actual SDK session ID for future resume.
-    // If the result has an error and no session ID was captured, clear the
-    // stale ID so the next message starts fresh instead of retrying a broken resume.
+    // An intentional abort (/stop) is not a broken session: keep the existing
+    // resume ID instead of clearing it. Only real errors clear a stale ID.
     if (binding.id) {
       try {
-        const update = computeSdkSessionUpdate(result.sdkSessionId, result.hasError);
+        const hasErrorForSession = result.hasError && !taskAbort.signal.aborted;
+        const update = computeSdkSessionUpdate(result.sdkSessionId, hasErrorForSession);
         if (update !== null) {
-          store.updateChannelBinding(binding.id, { sdkSessionId: update });
+          store.updateChannelBinding(
+            binding.id,
+            { sdkSessionId: update },
+            binding.codepilotSessionId,
+          );
         }
       } catch { /* best effort */ }
     }
@@ -828,6 +1092,7 @@ async function handleMessage(
     }
 
     state.activeTasks.delete(binding.codepilotSessionId);
+    state.activeTaskStartedAt.delete(binding.codepilotSessionId);
     // Notify adapter that message processing ended
     adapter.onMessageEnd?.(msg.address.chatId);
     // Commit the offset only after full processing (success or failure)
@@ -849,6 +1114,18 @@ async function handleCommand(
   const parts = text.split(/\s+/);
   const command = parts[0].split('@')[0].toLowerCase();
   const args = parts.slice(1).join(' ').trim();
+
+  // Commands bypass the session lock, so record them explicitly. This lets us
+  // distinguish "command never arrived" from "command ran" in the audit trail.
+  try {
+    store.insertAuditLog({
+      channelType: adapter.channelType,
+      chatId: msg.address.chatId,
+      direction: 'inbound',
+      messageId: msg.messageId,
+      summary: `[CMD] ${command}${args ? ` ${args.slice(0, 120)}` : ''}`,
+    });
+  } catch { /* best effort */ }
 
   // Run dangerous-input detection on the full command text
   const dangerCheck = isDangerousInput(text);
@@ -897,10 +1174,13 @@ async function handleCommand(
       // Abort any running task on the current session before creating a new one
       const oldBinding = router.resolve(msg.address);
       const st = getState();
+      // Invalidate queued turns for the old session before switching bindings.
+      bumpSessionEpoch(oldBinding.codepilotSessionId);
       const oldTask = st.activeTasks.get(oldBinding.codepilotSessionId);
       if (oldTask) {
         oldTask.abort();
         st.activeTasks.delete(oldBinding.codepilotSessionId);
+        st.activeTaskStartedAt.delete(oldBinding.codepilotSessionId);
       }
 
       let workDir: string | undefined;
@@ -964,13 +1244,32 @@ async function handleCommand(
 
     case '/status': {
       const binding = router.resolve(msg.address);
+      const st = getState();
+      const sessionId = binding.codepilotSessionId;
+      const startedAt = st.activeTaskStartedAt.get(sessionId);
+      const active = st.activeTasks.has(sessionId);
+      const elapsed = active && startedAt
+        ? formatElapsedMs(Date.now() - startedAt)
+        : '-';
+      const pendingPerms = store.listPendingPermissionLinksByChat(msg.address.chatId).length;
+      const lastMessageAt = st.adapterMeta.get(adapter.channelType)?.lastMessageAt ?? '-';
+      const health = adapter.getHealth?.() ?? null;
+      const buildSha = process.env.CTI_BUILD_SHA || 'unknown';
+      const buildAt = process.env.CTI_BUILD_AT || 'unknown';
       response = [
         '<b>Bridge Status</b>',
         '',
-        `Session: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>`,
+        `Session: <code>${sessionId.slice(0, 8)}...</code>`,
         `CWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`,
         `Mode: <b>${binding.mode}</b>`,
         `Model: <code>${binding.model || 'default'}</code>`,
+        `Turn: <b>${active ? 'running' : 'idle'}</b>${active ? ` · ${elapsed}` : ''}`,
+        `Queue: <b>${queuedTurnCount(sessionId)}</b>`,
+        `Pending permissions: <b>${pendingPerms}</b>`,
+        `Transport: <b>${health ? (health.connected ? 'running' : 'stopped') : 'unknown'}</b>${health?.detail ? ` · ${escapeHtml(health.detail)}` : ''}`,
+        `Last message: <code>${escapeHtml(lastMessageAt)}</code>`,
+        `Last event: <code>${escapeHtml(health?.lastEventAt || lastMessageAt)}</code>`,
+        `Build: <code>${escapeHtml(buildSha)}</code> (${escapeHtml(buildAt)})`,
       ].join('\n');
       break;
     }
@@ -992,12 +1291,17 @@ async function handleCommand(
 
     case '/stop': {
       const binding = router.resolve(msg.address);
-      const st = getState();
-      const taskAbort = st.activeTasks.get(binding.codepilotSessionId);
-      if (taskAbort) {
-        taskAbort.abort();
-        st.activeTasks.delete(binding.codepilotSessionId);
-        response = 'Stopping current task...';
+      const queued = queuedTurnCount(binding.codepilotSessionId);
+      // Invalidate anything already queued before aborting: those messages
+      // belong to the turn the user just cancelled and must not start a new one.
+      bumpSessionEpoch(binding.codepilotSessionId);
+      const stopped = abortActiveTask(msg.address);
+      if (stopped) {
+        response = queued > 0
+          ? `Stopping current task... Cancelled ${queued} queued message(s).`
+          : 'Stopping current task...';
+      } else if (queued > 0) {
+        response = `Cancelled ${queued} queued message(s).`;
       } else {
         response = 'No task is currently running.';
       }
@@ -1041,11 +1345,20 @@ async function handleCommand(
       }
 
       const resolvePerm = (permId: string): boolean => {
-        const resolved = broker.handlePermissionCallback(`perm:${permAction}:${permId}`, msg.address.chatId);
+        const resolved = broker.handlePermissionCallback(
+          `perm:${permAction}:${permId}`,
+          msg.address.chatId,
+          undefined,
+          adapter,
+        );
         // broker resolves `deny_stop` exactly like `deny`; aborting the turn is
         // ours to do, and only once something actually resolved. Idempotent, so
         // the `all` loop aborting on its first success is fine.
-        if (resolved && permAction === 'deny_stop') abortActiveTask(msg.address);
+        if (resolved && permAction === 'deny_stop') {
+          const binding = router.resolve(msg.address);
+          bumpSessionEpoch(binding.codepilotSessionId);
+          abortActiveTask(msg.address);
+        }
         return resolved;
       };
 
@@ -1143,4 +1456,12 @@ export function computeSdkSessionUpdate(
 // without wiring up the full adapter loop. The shortcut router is exported
 // too: its "4" handling is what keeps deny_stop out of the session lock.
 /** @internal */
-export const _testOnly = { handleMessage, isNumericPermissionShortcut };
+export const _testOnly = {
+  handleMessage,
+  isNumericPermissionShortcut,
+  normalizeCommandText,
+  queueRegularTurn,
+  getState,
+  summarizeToolInput,
+  classifyToolFailure,
+};

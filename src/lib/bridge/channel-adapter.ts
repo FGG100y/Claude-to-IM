@@ -13,6 +13,13 @@ import type {
   SendResult,
 } from './types.js';
 
+export interface AdapterHealth {
+  connected: boolean;
+  /** Last inbound event seen by the adapter, ISO timestamp. */
+  lastEventAt: string | null;
+  detail?: string;
+}
+
 export abstract class BaseChannelAdapter {
   /** Which channel type this adapter handles */
   abstract readonly channelType: ChannelType;
@@ -44,6 +51,24 @@ export abstract class BaseChannelAdapter {
    * Handles platform-specific formatting and API calls.
    */
   abstract send(message: OutboundMessage): Promise<SendResult>;
+
+  /**
+   * Edit a message the bot already sent. Used to keep a single permission
+   * batch card in sync as more requests arrive.
+   *
+   * Adapters that cannot edit messages keep the default: `ok: false`.
+   */
+  async updateMessage(_messageId: string, _message: OutboundMessage): Promise<SendResult> {
+    return { ok: false, error: 'Message updates are not supported by this adapter' };
+  }
+
+  /**
+   * Optional health snapshot for `/status`. Adapters that cannot report
+   * transport state keep the default and `/status` shows "unknown".
+   */
+  getHealth(): AdapterHealth | null {
+    return null;
+  }
 
   /**
    * Answer a callback query (e.g. Telegram inline button press).

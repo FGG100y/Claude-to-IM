@@ -72,6 +72,8 @@ export interface BridgeSession {
   model: string;
   system_prompt?: string;
   provider_id?: string;
+  /** SDK session id cached on the session so a rebind can resume its context. */
+  sdk_session_id?: string;
 }
 
 /** Minimal message object returned by the store. */
@@ -105,6 +107,11 @@ export interface PermissionLinkInput {
   messageId: string;
   toolName: string;
   suggestions: string;
+  /**
+   * Permission batch this request belongs to (Feishu batch cards).
+   * Optional: links written before batching existed have no batch id.
+   */
+  batchId?: string;
 }
 
 /** Stored permission link record. */
@@ -117,6 +124,8 @@ export interface PermissionLinkRecord {
   /** Tool the permission was requested for. Optional: records written before
    *  this field existed won't have it. */
   toolName?: string;
+  /** Batch id for grouped permission cards (Feishu). Optional for old records. */
+  batchId?: string;
 }
 
 /** Input for inserting an outbound reference. */
@@ -150,7 +159,18 @@ export interface BridgeStore {
   // ── Channel bindings ──
   getChannelBinding(channelType: string, chatId: string): ChannelBinding | null;
   upsertChannelBinding(data: UpsertChannelBindingInput): ChannelBinding;
-  updateChannelBinding(id: string, updates: Partial<ChannelBinding>): void;
+  /**
+   * Apply a partial update to a binding.
+   *
+   * `expectedCodepilotSessionId` guards against stale writes: a turn that
+   * finishes after the chat was rebound (e.g. by /new) must not overwrite the
+   * new binding's SDK session id.
+   */
+  updateChannelBinding(
+    id: string,
+    updates: Partial<ChannelBinding>,
+    expectedCodepilotSessionId?: string,
+  ): void;
   listChannelBindings(channelType?: ChannelType): ChannelBinding[];
 
   // ── Sessions ──

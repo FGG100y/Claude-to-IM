@@ -40,10 +40,25 @@ export type OnPermissionRequest = (perm: PermissionRequestInfo) => Promise<void>
 export type OnPartialText = (fullText: string) => void;
 
 /**
+ * Extra context for a tool event. `input` is present on tool_use; `result` is
+ * present on tool_result and is used to classify denials and tool errors.
+ */
+export interface ToolEventDetail {
+  input?: unknown;
+  isError?: boolean;
+  result?: unknown;
+}
+
+/**
  * Callback invoked when tool_use or tool_result SSE events arrive.
  * Used by bridge-manager to forward tool progress to adapters for real-time display.
  */
-export type OnToolEvent = (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => void;
+export type OnToolEvent = (
+  toolId: string,
+  toolName: string,
+  status: 'running' | 'complete' | 'error',
+  detail?: ToolEventDetail,
+) => void;
 
 export interface ConversationResult {
   responseText: string;
@@ -255,7 +270,11 @@ async function consumeStream(
                 input: toolData.input,
               });
               if (onToolEvent) {
-                try { onToolEvent(toolData.id, toolData.name, 'running'); } catch { /* non-critical */ }
+                try {
+                  onToolEvent(toolData.id, toolData.name, 'running', {
+                    input: toolData.input,
+                  });
+                } catch { /* non-critical */ }
               }
             } catch { /* skip */ }
             break;
@@ -285,6 +304,10 @@ async function consumeStream(
                     resultData.tool_use_id,
                     '', // name not available in tool_result, adapter tracks by id
                     resultData.is_error ? 'error' : 'complete',
+                    {
+                      isError: resultData.is_error || false,
+                      result: resultData.content,
+                    },
                   );
                 } catch { /* non-critical */ }
               }

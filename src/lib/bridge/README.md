@@ -6,11 +6,12 @@ A host-agnostic bridge that connects IM platforms (Telegram, Discord, Feishu/Lar
 
 - **Multi-platform**: Telegram (long polling), Discord (Gateway), Feishu/Lark (WSClient)
 - **Streaming previews**: Real-time response drafts via message editing
-- **Permission management**: Interactive inline buttons for tool approvals
+- **Permission management**: Interactive inline buttons for tool approvals; Feishu batches later requests into one editable card; `/stop` is a soft turn cancel and queued messages cannot revive a stopped turn
 - **Session binding**: Each IM chat maps to a persistent conversation session
 - **Markdown rendering**: Platform-native formatting (HTML for Telegram, Discord Markdown, Feishu cards)
 - **Security**: Input validation, rate limiting, authorization, audit logging
 - **Reliable delivery**: Auto-chunking, retry with backoff, HTML fallback, dedup
+- **Safe progress UI**: Tool calls are aggregated (success count, running counts, bounded failure details) instead of one line per call
 
 ## Architecture
 

@@ -66,6 +66,11 @@ export interface OutboundMessage {
   parseMode?: 'HTML' | 'Markdown' | 'plain';
   /** Inline keyboard buttons */
   inlineButtons?: InlineButton[][];
+  /**
+   * Optional title for card-capable channels (Feishu interactive cards).
+   * Adapters that do not render cards ignore it.
+   */
+  cardTitle?: string;
   /** If replying to a specific message */
   replyToMessageId?: string;
 }
@@ -174,6 +179,12 @@ export interface ToolCallInfo {
   id: string;
   name: string;
   status: 'running' | 'complete' | 'error';
+  /** One-line input summary (command, URL, query, path, ...). */
+  inputSummary?: string;
+  /** Why an errored tool call failed. */
+  errorKind?: 'denied' | 'timeout' | 'tool_error' | 'policy';
+  /** Truncated, redacted error text shown to the user. */
+  errorMessage?: string;
 }
 
 // ── Config ─────────────────────────────────────────────────────

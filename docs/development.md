@@ -199,6 +199,8 @@ When Claude requests permission to use a tool, the bridge sends an interactive m
 
 `markPermissionLinkResolved()` must be atomic: return `true` only if the link exists and has not been resolved yet, then mark it as resolved. This prevents double-resolution from rapid button clicks.
 
+`PermissionLinkInput` / `PermissionLinkRecord` also carry an optional `batchId`. Feishu uses it to resolve a whole permission batch at once; persist it alongside the other link fields so batch callbacks keep working across the store layer.
+
 #### Channel Offsets
 
 ```typescript
@@ -628,6 +630,12 @@ class MyPlatformAdapter extends BaseChannelAdapter {
       return { ok: false, error: err.message };
     }
   }
+
+  // Optional: implement this when the platform can edit messages. Feishu uses
+  // it to keep one permission batch card in sync as more requests arrive.
+  // async updateMessage(messageId: string, message: OutboundMessage): Promise<SendResult> {
+  //   return this.platformApi.patchMessage(messageId, message.text);
+  // }
 
   validateConfig(): string | null {
     const { store } = getBridgeContext();

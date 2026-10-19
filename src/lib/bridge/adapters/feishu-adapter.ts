@@ -20,6 +20,7 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import type {
   ChannelType,
   InboundMessage,
+  InlineButton,
   OutboundMessage,
   SendResult,
 } from '../types.js';
@@ -35,12 +36,57 @@ import {
   buildPostContent,
   buildStreamingContent,
   buildFinalCardJson,
-  buildPermissionButtonCard,
+  buildToolProgressMarkdown,
+  buildPermissionActionCard,
   formatElapsed,
 } from '../markdown/feishu.js';
 
 /** Max number of message_ids to keep for dedup. */
 const DEDUP_MAX = 1000;
+
+/**
+ * Batch permission cards use `perm:batch:<batchId>:<action>` callbacks. The
+ * card renderer only needs to know whether the buttons are a batch, so the
+ * fallback text can offer `/perm <action> all` instead of per-id commands.
+ */
+function isBatchPermissionCallback(inlineButtons: InlineButton[][]): boolean {
+  return inlineButtons.some((row) =>
+    row.some((btn) => btn.callbackData.startsWith('perm:batch:')),
+  );
+}
+
+/** Render fallback copyable commands when a card cannot be sent. */
+function permissionFallbackCommands(inlineButtons: InlineButton[][]): string[] {
+  return inlineButtons.flat().map((btn) => {
+    if (btn.callbackData.startsWith('perm:batch:')) {
+      const action = btn.callbackData.split(':').pop() || 'allow';
+      return `\`/perm ${action} all\``;
+    }
+    if (btn.callbackData.startsWith('perm:')) {
+      const parts = btn.callbackData.split(':');
+      const action = parts[1];
+      const id = parts.slice(2).join(':');
+      return `\`/perm ${action} ${id}\``;
+    }
+    return btn.text;
+  });
+}
+
+/**
+ * Convert the HTML snippet produced by permission-broker into card markdown.
+ * Card markdown elements do not understand HTML tags.
+ */
+function permissionHtmlToMarkdown(text: string): string {
+  return text
+    .replace(/<b>(.*?)<\/b>/gi, '**$1**')
+    .replace(/<code>(.*?)<\/code>/gi, '`$1`')
+    .replace(/<pre>([\s\S]*?)<\/pre>/gi, '```\n$1\n```')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"');
+}
 
 /** Max file download size (20 MB). */
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
@@ -55,6 +101,8 @@ interface FeishuCardState {
   sequence: number;
   startTime: number;
   toolCalls: ToolCallInfo[];
+  /** Last rendered tool summary; skips identical card updates. */
+  lastToolSummary: string;
   thinking: boolean;
   pendingText: string | null;
   lastUpdateAt: number;
@@ -114,11 +162,21 @@ const MIME_BY_TYPE: Record<string, string> = {
 export class FeishuAdapter extends BaseChannelAdapter {
   readonly channelType: ChannelType = 'feishu';
 
+  /**
+   * Hard limit applied while a resource is streamed, before it is buffered and
+   * base64-encoded. Subclasses (the host access layer) may lower it from
+   * configuration so an oversized attachment is rejected during download
+   * rather than after the whole message has already been fetched.
+   */
+  protected maxResourceBytes = MAX_FILE_SIZE;
+
   private running = false;
   private queue: InboundMessage[] = [];
   private waiters: Array<(msg: InboundMessage | null) => void> = [];
   private wsClient: lark.WSClient | null = null;
   private restClient: lark.Client | null = null;
+  /** Last inbound event accepted by the WS dispatcher (before filters). */
+  private lastEventAt: string | null = null;
   private seenMessageIds = new Map<string, boolean>();
   private botOpenId: string | null = null;
   /** All known bot IDs (open_id, user_id, union_id) for mention matching. */
@@ -251,6 +309,29 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   isRunning(): boolean {
     return this.running;
+  }
+
+  getHealth(): { connected: boolean; lastEventAt: string | null; detail?: string } {
+    // The Lark SDK does not expose a public connection-state API. Its internal
+    // wsConfig.getWSInstance() wrapper does expose the underlying WebSocket's
+    // readyState, which is enough to distinguish "adapter started" from "WS is
+    // actually open" in /status. If the internal shape changes, report unknown
+    // instead of pretending the channel is healthy.
+    let readyState: number | undefined;
+    try {
+      const ws = (this.wsClient as unknown as {
+        wsConfig?: { getWSInstance?: () => { readyState?: number } | null };
+      } | null)?.wsConfig?.getWSInstance?.();
+      if (typeof ws?.readyState === 'number') readyState = ws.readyState;
+    } catch { /* report unknown */ }
+
+    return {
+      connected: this.running && readyState === 1,
+      lastEventAt: this.lastEventAt,
+      detail: readyState === undefined
+        ? (this.wsClient ? 'ws-instance-missing' : 'ws-client-missing')
+        : `ws-readyState=${readyState}`,
+    };
   }
 
   // ── Queue ───────────────────────────────────────────────────
@@ -459,6 +540,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         sequence: 0,
         startTime: Date.now(),
         toolCalls: [],
+        lastToolSummary: '',
         thinking: true,
         pendingText: null,
         lastUpdateAt: 0,
@@ -574,6 +656,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const state = this.activeCards.get(chatId);
     if (!state) return;
     state.toolCalls = tools;
+
+    // Thirty WebSearch calls used to produce thirty card updates even when the
+    // rendered summary was identical. Only flush when the summary changes.
+    const summary = buildToolProgressMarkdown(tools);
+    if (summary === state.lastToolSummary) return;
+    state.lastToolSummary = summary;
+
     // Trigger a content flush with current text + updated tools
     this.updateCardContent(chatId, state.pendingText || '');
   }
@@ -748,7 +837,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // If there are inline buttons (permission prompts), send card with action buttons
     if (message.inlineButtons && message.inlineButtons.length > 0) {
-      return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons);
+      return this.sendPermissionCard(
+        message.address.chatId,
+        text,
+        message.inlineButtons,
+        message.cardTitle,
+      );
     }
 
     // Rendering strategy (aligned with Openclaw):
@@ -839,87 +933,88 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Send a permission card with real Feishu card action buttons.
    * Button clicks trigger card.action.trigger events handled by handleCardAction().
    * Falls back to text-based /perm commands if button card fails.
+   *
+   * This builder is intentionally generic: individual permission cards pass
+   * `perm:<action>:<id>` callbacks, batch cards pass
+   * `perm:batch:<batchId>:<action>`. The broker owns the semantics; the
+   * adapter only renders buttons and supplies a text fallback.
    */
   private async sendPermissionCard(
     chatId: string,
     text: string,
     inlineButtons: import('../types.js').InlineButton[][],
+    cardTitle?: string,
   ): Promise<SendResult> {
     if (!this.restClient) {
       return { ok: false, error: 'Feishu client not initialized' };
     }
 
     // Convert HTML text from permission-broker to Feishu markdown.
-    // permission-broker sends HTML (<b>, <code>, <pre>, &amp; entities)
-    // but Feishu card markdown elements don't understand HTML.
-    const mdText = text
-      .replace(/<b>(.*?)<\/b>/gi, '**$1**')
-      .replace(/<code>(.*?)<\/code>/gi, '`$1`')
-      .replace(/<pre>([\s\S]*?)<\/pre>/gi, '```\n$1\n```')
-      .replace(/<[^>]+>/g, '')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&amp;/g, '&')
-      .replace(/&quot;/g, '"');
+    const mdText = permissionHtmlToMarkdown(text);
 
-    // Extract permissionRequestId from the first button's callback data
-    const firstBtn = inlineButtons.flat()[0];
-    const permId = firstBtn?.callbackData?.startsWith('perm:')
-      ? firstBtn.callbackData.split(':').slice(2).join(':')
-      : '';
+    const isBatch = isBatchPermissionCallback(inlineButtons);
 
-    if (permId) {
-      // Use real card action buttons
-      const cardJson = buildPermissionButtonCard(mdText, permId, chatId);
+    // Use real card action buttons
+    const cardJson = buildPermissionActionCard(mdText, inlineButtons, chatId, {
+      title: cardTitle || (isBatch ? '还有待批准请求' : 'Permission Required'),
+      template: isBatch ? 'orange' : 'blue',
+      iconToken: isBatch ? undefined : 'lock-chat_filled',
+      expiryNote: isBatch
+        ? '⏱ 本批请求 5 分钟内未处理将按拒绝处理'
+        : '⏱ This request will expire in 5 minutes',
+      commandHint: isBatch
+        ? '逐条处理：`/perm list` → `/perm allow|allow_session|deny|deny_stop #编号`'
+        : 'Or reply: `1` Allow · `2` Allow Session · `3` Deny · `4` Deny & Stop',
+    });
 
-      try {
-        const res = await this.restClient.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'interactive',
-            content: cardJson,
-          },
-        });
-        if (res?.data?.message_id) {
-          return { ok: true, messageId: res.data.message_id };
-        }
-        console.warn('[feishu-adapter] Permission button card send failed:', JSON.stringify({ code: (res as any)?.code, msg: res?.msg }));
-      } catch (err) {
-        console.warn('[feishu-adapter] Permission button card error, falling back to text:', err instanceof Error ? err.message : err);
+    try {
+      const res = await this.restClient.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: cardJson,
+        },
+      });
+      if (res?.data?.message_id) {
+        return { ok: true, messageId: res.data.message_id };
       }
+      console.warn('[feishu-adapter] Permission button card send failed:', JSON.stringify({ code: (res as any)?.code, msg: res?.msg }));
+    } catch (err) {
+      console.warn('[feishu-adapter] Permission button card error, falling back to text:', err instanceof Error ? err.message : err);
     }
 
     // Fallback: text-based permission commands (same as before, for backward compat)
-    const permCommands = inlineButtons.flat().map((btn) => {
-      if (btn.callbackData.startsWith('perm:')) {
-        const parts = btn.callbackData.split(':');
-        const action = parts[1];
-        const id = parts.slice(2).join(':');
-        return `\`/perm ${action} ${id}\``;
-      }
-      return btn.text;
-    });
+    const permCommands = permissionFallbackCommands(inlineButtons);
 
-    const cardContent = [
-      mdText,
-      '',
-      '---',
-      '**Reply:**',
-      '`1` - Allow once',
-      '`2` - Allow session',
-      '`3` - Deny',
-      '',
-      'Or use full commands:',
-      ...permCommands,
-    ].join('\n');
+    const fallbackLines = isBatch
+      ? [
+          mdText,
+          '',
+          '---',
+          '**批量处理：**',
+          ...permCommands,
+        ]
+      : [
+          mdText,
+          '',
+          '---',
+          '**Reply:**',
+          '`1` - Allow once',
+          '`2` - Allow session',
+          '`3` - Deny',
+          '',
+          'Or use full commands:',
+          ...permCommands,
+        ];
+    const cardContent = fallbackLines.join('\n');
 
-    const cardJson = JSON.stringify({
+    const fallbackCardJson = JSON.stringify({
       schema: '2.0',
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: {
         template: 'orange',
-        title: { tag: 'plain_text', content: '🔐 Permission Required' },
+        title: { tag: 'plain_text', content: isBatch ? '🔐 还有待批准请求' : '🔐 Permission Required' },
       },
       body: {
         elements: [
@@ -934,7 +1029,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         data: {
           receive_id: chatId,
           msg_type: 'interactive',
-          content: cardJson,
+          content: fallbackCardJson,
         },
       });
       if (res?.data?.message_id) {
@@ -950,7 +1045,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
       mdText,
       '',
       '---',
-      'Reply: 1 = Allow once | 2 = Allow session | 3 = Deny',
+      isBatch
+        ? '批量处理：'
+        : 'Reply: 1 = Allow once | 2 = Allow session | 3 = Deny',
       '',
       ...permCommands,
     ].join('\n');
@@ -970,6 +1067,65 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return { ok: false, error: res?.msg || 'Send failed' };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : 'Send failed' };
+    }
+  }
+
+  /**
+   * Edit a permission card already sent by the bot.
+   *
+   * Feishu only allows patching shared cards that declare
+   * `config.update_multi: true` (see buildPermissionActionCard). Batch cards
+   * are edited in place so a burst of requests produces one growing card
+   * instead of one message per request.
+   */
+  async updateMessage(messageId: string, message: OutboundMessage): Promise<SendResult> {
+    if (!this.restClient) {
+      return { ok: false, error: 'Feishu client not initialized' };
+    }
+
+    const text = message.parseMode === 'HTML'
+      ? permissionHtmlToMarkdown(message.text)
+      : message.text;
+
+    const inlineButtons = message.inlineButtons ?? [];
+    const isBatch = isBatchPermissionCallback(inlineButtons);
+
+    const cardJson = buildPermissionActionCard(
+      text,
+      inlineButtons,
+      message.address.chatId,
+      {
+        title: message.cardTitle || (isBatch ? '还有待批准请求' : 'Permission Required'),
+        template: isBatch ? 'orange' : 'blue',
+        iconToken: isBatch ? undefined : 'lock-chat_filled',
+        showButtons: inlineButtons.length > 0,
+        // Once a batch is resolved we remove the buttons; no expiry/command
+        // hint is sent in that update, which keeps the final card quiet.
+        expiryNote: inlineButtons.length > 0
+          ? (isBatch
+              ? '⏱ 本批请求 5 分钟内未处理将按拒绝处理'
+              : '⏱ This request will expire in 5 minutes')
+          : undefined,
+        commandHint: inlineButtons.length > 0 && isBatch
+          ? '逐条处理：`/perm list` → `/perm allow|allow_session|deny|deny_stop #编号`'
+          : undefined,
+      },
+    );
+
+    try {
+      const res = await this.restClient.im.message.patch({
+        path: { message_id: messageId },
+        data: { content: cardJson },
+      }) as { code?: number; msg?: string; data?: { message_id?: string } } | undefined;
+      if (res?.data?.message_id || res?.code === 0) {
+        return { ok: true, messageId };
+      }
+      console.warn('[feishu-adapter] Permission card update failed:', JSON.stringify({ code: (res as any)?.code, msg: res?.msg }));
+      return { ok: false, error: res?.msg || 'Update failed' };
+    } catch (err) {
+      const error = err instanceof Error ? err.message : 'Update failed';
+      console.warn('[feishu-adapter] Permission card update error:', error);
+      return { ok: false, error };
     }
   }
 
@@ -1019,6 +1175,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private async processIncomingEvent(data: FeishuMessageEventData): Promise<void> {
+    this.lastEventAt = new Date().toISOString();
     const msg = data.message;
     const sender = data.sender;
 
@@ -1391,8 +1548,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
         for await (const chunk of readable) {
           const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
           totalSize += buf.length;
-          if (totalSize > MAX_FILE_SIZE) {
-            console.warn(`[feishu-adapter] Resource too large (>${MAX_FILE_SIZE} bytes), key: ${fileKey}`);
+          if (totalSize > this.maxResourceBytes) {
+            console.warn(`[feishu-adapter] Resource too large (>${this.maxResourceBytes} bytes), key: ${fileKey}`);
             return null;
           }
           chunks.push(buf);
@@ -1409,8 +1566,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
         try {
           await res.writeFile(tmpPath);
           buffer = fs.readFileSync(tmpPath);
-          if (buffer.length > MAX_FILE_SIZE) {
-            console.warn(`[feishu-adapter] Resource too large (>${MAX_FILE_SIZE} bytes), key: ${fileKey}`);
+          if (buffer.length > this.maxResourceBytes) {
+            console.warn(`[feishu-adapter] Resource too large (>${this.maxResourceBytes} bytes), key: ${fileKey}`);
             return null;
           }
         } finally {
